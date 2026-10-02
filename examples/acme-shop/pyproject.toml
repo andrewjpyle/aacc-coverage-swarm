@@ -1,0 +1,9 @@
+[project]
+name = "acme-shop"
+version = "0.0.0"
+description = "FICTIONAL sample package for the aacc-coverage-swarm demo"
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
