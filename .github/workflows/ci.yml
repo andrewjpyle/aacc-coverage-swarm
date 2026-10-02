@@ -1,0 +1,45 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [20, 22, 24]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Tests (fails if fewer tests ran than the floor, so a gutted suite cannot pass)
+        run: |
+          set -o pipefail
+          node --test --test-reporter=tap test/*.test.mjs | tee tap.txt
+          PASS=$(awk '/^ok /{n++} END{print n+0}' tap.txt)
+          FAIL=$(awk '/^not ok /{n++} END{print n+0}' tap.txt)
+          echo "passed: $PASS failed: $FAIL floor: 31"
+          test "$FAIL" -eq 0
+          test "$PASS" -ge 31
+
+  demo-baseline:
+    # The committed demo package must still run and still have the weak coverage the
+    # README's real run started from, or the example no longer reproduces.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Demo suite runs and is below target
+        working-directory: examples/acme-shop
+        run: |
+          set -o pipefail
+          uv run --no-project --with pytest --with pytest-cov pytest --cov=acme_shop --cov-report=json -q
+          python3 -c "import json; t=json.load(open('coverage.json'))['totals']['percent_covered']; print('demo coverage', t); assert t < 70, t"
