@@ -480,7 +480,7 @@ const runModule = async (m) => {
     if (Number.isFinite(ended) && ended > current) { current = ended; noProgress = 0 } else { noProgress++ }
     log(`${m.name}: round ${r} ${res.started_percent}% -> ${res.ended_percent}% (+${res.tests_added} tests)${noProgress ? `, no gain x${noProgress}` : ''}`)
     if (current >= m.target) { stop = 'target_met'; break }
-    if (noProgress >= NO_PROGRESS_ROUNDS) { stop = 'no_progress'; break }
+    if (noProgress > NO_PROGRESS_ROUNDS) { stop = 'no_progress'; break }
   }
   if (!stop) stop = 'max_rounds'
   const testsAdded = rounds.reduce((n, r) => n + (r.tests_added || 0), 0)
