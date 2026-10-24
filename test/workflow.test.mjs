@@ -278,3 +278,64 @@ test('the full run: measure, per-module rounds and gate, then one report; all mo
   assert.equal(result.verdict, 'moved');
   assert.deepEqual(result.claimed_modules, ['shop/pricing.py', 'shop/stock.py']);
 });
+
+// ── bounded runs + concurrency cap ──
+
+const manyModules = (n) => ({
+  ...MEASURE,
+  modules: Array.from({ length: n }, (_, i) => ({
+    name: `shop/m${i}.py`, path: `shop/m${i}.py`, kind: 'other', percent: 30, lines_total: 60, lines_missed: 42,
+  })),
+});
+
+// Cover agents resolve after a timer, so in-flight module chains really overlap; track the peak.
+const concurrencyRun = async (args, n) => {
+  let inFlight = 0, peak = 0;
+  const base = respond({ 'measure:baseline': manyModules(n) });
+  const out = await runWorkflow({ repo_path: REPO, max_modules: n, max_rounds: 1, ...args }, async (label, ...rest) => {
+    const v = base(label, ...rest);
+    if (!label.startsWith('cover:')) return v;
+    inFlight++; peak = Math.max(peak, inFlight);
+    await new Promise((r) => setTimeout(r, 5));
+    inFlight--;
+    return v;
+  });
+  return { ...out, peak };
+};
+
+test('module agents run at most max_parallel at a time (default 8), and every module still runs', async () => {
+  const { result, peak } = await concurrencyRun({}, 20);
+  assert.equal(peak, 8);
+  assert.equal(result.modules.length, 20);
+});
+
+test('max_parallel is configurable and results stay aligned with the claimed modules', async () => {
+  const { result, peak } = await concurrencyRun({ max_parallel: 3 }, 7);
+  assert.equal(peak, 3);
+  assert.deepEqual(result.modules.map((o) => o.module), result.claimed_modules);
+});
+
+test('refuses a non-integer max_parallel', async () => {
+  await assert.rejects(run({ max_parallel: 'lots' }), /max_parallel must be an integer/);
+});
+
+test('every agent prompt routes runs through the process-group bounded runner and bounds its waits', async () => {
+  const { calls } = await run({ max_modules: 1 });
+  for (const label of ['measure:baseline', 'cover:shop/pricing.py:r1', 'gate:shop/pricing.py']) {
+    const p = calls.find((c) => c.opts.label === label).prompt;
+    assert.match(p, /bounded_run\.py --timeout 180/, label);
+    assert.match(p, /own process group/, label);
+    assert.match(p, /os\.killpg/, label);
+    assert.match(p, /--timeout=60/, label);
+    assert.match(p, /Kill every background job/, label);
+    assert.match(p, /maximum\s+number of iterations/, label);
+  }
+});
+
+test('the gate counts a timed-out or OOM-killed mutant as KILLED and restores the source in a finally block', async () => {
+  const { calls } = await run({ max_modules: 1 });
+  const p = calls.find((c) => c.opts.label === 'gate:shop/pricing.py').prompt;
+  assert.match(p, /TIMES OUT, hangs, or\s+is killed for memory counts as KILLED/);
+  assert.match(p, /--mutate <file>/);
+  assert.match(p, /restores the source in a finally block/);
+});

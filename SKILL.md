@@ -61,6 +61,7 @@ A run that rejects zero vacuous tests is flagged as suspicious, not excellent.
    | `label` | plain label for the report (defaults to the repo folder name) |
    | `max_modules` | modules this run claims, 1 to 50 (default 3) |
    | `max_rounds` | cover rounds per module, 1 to 10 (default 3) |
+   | `max_parallel` | most module agents running at once, 1 to 50 (default 8); extra modules run in later batches |
    | `target` | per-module coverage target, overriding the kind-based defaults |
    | `worktree_root` | where module worktrees go (default `<repo>.coverage-swarm/` next to the repo) |
    | `dry_run` | `true` = measure and rank only, one agent, nothing written |
@@ -104,6 +105,49 @@ around.
 The script runs the rounds: each asks for `current + 10`, capped at the module target. It stops at
 the target, after 2 consecutive rounds with no measured gain (and names the module as hard), or at
 `max_rounds`.
+
+## Bounded runs and a concurrency cap
+
+A mutant can break a loop exit, so a test loops forever and its memory grows without limit. A
+mutation runner that wraps `uv run pytest` in `subprocess.run(..., timeout=180)` then kills only
+`uv`. The python grandchild is orphaned and keeps growing. On one 64 GB workstation, three such
+orphans at about 100 GB each caused a kernel panic.
+
+**A timeout around a wrapper (`uv run`, `npx`, `doppler run`, a shell) does not stop the real test
+process.** The fix is to kill the whole process group.
+
+`bounded_run.py` (stdlib only, in this skill) does that. It starts the command in its own process
+group, kills the whole group on timeout (exit code 124), kills any leftover group members after a
+normal exit, and writes output to a temp file, not memory. Its mutate mode applies one mutation, runs
+the tests, restores the source in a `finally` block, and prints one JSON line:
+
+```
+python3 ~/.claude/skills/aacc-coverage-swarm/bounded_run.py --timeout 180 --cwd <worktree> -- \
+  .venv/bin/python -m pytest tests/test_x.py --timeout=60 -x -q
+
+python3 ~/.claude/skills/aacc-coverage-swarm/bounded_run.py --timeout 180 --cwd <worktree> \
+  --mutate src/x/service.py --old "not recs or " --new "" -- \
+  .venv/bin/python -m pytest tests/test_x.py --timeout=60 -x -q
+```
+
+The workflow gives every agent (measure, cover, gate) these rules:
+
+- Run every test and mutation command through `bounded_run.py`. Never hand-roll
+  `subprocess.run(timeout=...)` or `execSync` around a test runner.
+- Bound the test itself too. pytest gets `--timeout=60` (needs the `pytest-timeout` plugin; without
+  it the runner timeout is the bound). vitest gets `--testTimeout=60000`.
+- A mutant that times out, hangs, or is killed for memory counts as KILLED (`killed_timeout`).
+- The source is restored in a `finally` block, so a crash cannot leave a mutation behind.
+- No lingering background shells, and no unbounded waits (every polling loop has a maximum number
+  of iterations).
+
+`test/test_bounded_run.py` proves the helper: a wrapper spawns a looping grandchild, and the
+grandchild must be gone after the helper times out. A control test shows plain `subprocess.run`
+leaves it alive. Run it with `python3 -m pytest test/test_bounded_run.py --timeout=60`.
+
+The script also caps fan-out: at most `max_parallel` (default 8) module chains run at once. Each
+chain runs a full test suite, and its gate runs one per mutant, so memory grows with the number of
+chains in flight.
 
 ## Cost
 

@@ -91,6 +91,7 @@ Workflow({
 | `test_cmd` | worked out | the command that runs your suite WITH a coverage report; passing it is more reliable |
 | `max_modules` | `3` | modules this run claims (1 to 50); a non-integer is refused, not treated as 0 |
 | `max_rounds` | `3` | cover rounds per module (1 to 10) |
+| `max_parallel` | `8` | most module agents running at once (1 to 50); extra modules run in later batches. Every test and mutation run goes through `bounded_run.py`, which kills the whole process group on timeout |
 | `target` | by kind | per-module target; otherwise 70%, or a Django-flavoured table (models 90, api 85, ...) |
 | `worktree_root` | `<repo>.coverage-swarm/` | where module worktrees go; always outside the repo so your runner never collects them |
 | `label` | repo folder name | name used in the report |
