@@ -26,9 +26,18 @@ jobs:
           node --test --test-reporter=tap test/*.test.mjs | tee tap.txt
           PASS=$(awk '/^ok /{n++} END{print n+0}' tap.txt)
           FAIL=$(awk '/^not ok /{n++} END{print n+0}' tap.txt)
-          echo "passed: $PASS failed: $FAIL floor: 31"
+          echo "passed: $PASS failed: $FAIL floor: 36"
           test "$FAIL" -eq 0
-          test "$PASS" -ge 31
+          test "$PASS" -ge 36
+
+  bounded-run:
+    # The process-group runner must kill a looping grandchild, not just its wrapper.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: bounded_run.py tests
+        run: uv run --no-project --with pytest --with pytest-timeout pytest test/test_bounded_run.py --timeout=60 -q
 
   demo-baseline:
     # The committed demo package must still run and still have the weak coverage the

@@ -35,6 +35,39 @@ const DEFAULT_MAX_ROUNDS = 3
 // Modules smaller than this are skipped as noise (and the skip is logged).
 const MIN_MODULE_LINES = 20
 
+// Origin: a 64 GB workstation kernel-panicked during a coverage-swarm run. A mutant
+// broke a loop exit, so a test looped forever while a fixture grew a list. The runner
+// used subprocess.run(["uv","run","pytest",...], timeout=180). On timeout Python
+// SIGKILLed only `uv`; the python grandchild was orphaned and grew to ~100 GB. Three of
+// them filled the compressor. A timeout around a wrapper (uv, npx, doppler, sh) does
+// not stop the real test process. So: every run goes through bounded_run.py (own
+// process group, the whole group is killed on timeout), pytest also gets --timeout so
+// it fires in-process, and at most MAX_PARALLEL module agents run at once.
+const DEFAULT_MAX_PARALLEL = 8
+const MUTATION_RUN_TIMEOUT_S = 180
+const MUTANT_TEST_TIMEOUT_S = 60
+const BOUNDED_RUNNER = '~/.claude/skills/aacc-coverage-swarm/bounded_run.py'
+
+const BOUNDED_RUNS = `BOUNDED RUNS (hard rule: a mutant broke a loop exit, the runner's timeout killed
+only \`uv\`, and the orphaned pytest grandchild grew to ~100 GB and crashed the whole machine).
+- Run EVERY test and mutation command through the bounded runner, never a hand-rolled
+  subprocess.run / execSync:
+    python3 ${BOUNDED_RUNNER} --timeout ${MUTATION_RUN_TIMEOUT_S} --cwd <worktree> -- <test command>
+  It starts the command in its own process group and on timeout SIGKILLs the WHOLE
+  group, so no grandchild survives (exit code 124 = timed out). A timeout around
+  \`uv run\`, \`npx\`, \`doppler run\` or a shell is NOT enough on its own.
+- If you truly must script a runner yourself: Python Popen(..., start_new_session=True)
+  and on TimeoutExpired os.killpg(proc.pid, signal.SIGKILL); node spawn(..., { detached: true })
+  and process.kill(-child.pid, 'SIGKILL'). Prefer calling the venv directly
+  (\`.venv/bin/python -m pytest\`) over \`uv run pytest\`.
+- ALSO bound the test itself, so the timeout fires in-process: pytest
+  --timeout=${MUTANT_TEST_TIMEOUT_S} (needs pytest-timeout; without it rely on the
+  runner's timeout), vitest --testTimeout=${MUTANT_TEST_TIMEOUT_S * 1000}.
+- Do not leave anything running. Kill every background job, shell, or runner you
+  started before you return (\`jobs -p | xargs kill\`, or kill the pids you recorded).
+- No unbounded waits. A polling loop (\`until ...; do sleep N; done\`) has a maximum
+  number of iterations. Never wait forever on a process or a file.`
+
 // ── schemas ────────────────────────────────────────────────────────────────
 
 const MEASURE_SCHEMA = {
@@ -214,6 +247,9 @@ const intArg = (name, dflt, min, max) => {
 }
 const maxModules = intArg('max_modules', 3, 1, 50)
 const maxRounds = intArg('max_rounds', DEFAULT_MAX_ROUNDS, 1, 10)
+// Concurrency cap on module agents: each one runs a full test suite (and a gate runs
+// it once per mutant), so unbounded fan-out multiplies memory by max_modules.
+const maxParallel = intArg('max_parallel', DEFAULT_MAX_PARALLEL, 1, 50)
 let explicitTarget = null
 if (A.target != null && A.target !== '') {
   explicitTarget = Number(A.target)
@@ -230,7 +266,7 @@ const parentDir = repoPath.slice(0, repoPath.length - repoBase.length - 1)
 const worktreeRoot = String(A.worktree_root || `${parentDir}/${repoBase}.coverage-swarm`).trim().replace(/\/+$/, '')
 const label = String(A.label || repoBase || 'coverage-swarm').trim()
 
-log(`Coverage swarm: label=${label} repo=${repoPath} modules<=${maxModules} rounds<=${maxRounds}${dryRun ? ' (DRY RUN, no tests written)' : ''}`)
+log(`Coverage swarm: label=${label} repo=${repoPath} modules<=${maxModules} rounds<=${maxRounds} parallel<=${maxParallel}${dryRun ? ' (DRY RUN, no tests written)' : ''}`)
 
 // ── Phase 1: MEASURE (fresh, local, never a pasted number) ─────────────────
 
@@ -259,6 +295,8 @@ Steps:
    is_product_bug.
 6. Classify each module by kind (models/api/views/services/commands/serializers/
    tasks/other) from its path.
+
+${BOUNDED_RUNS}
 
 If the suite cannot run at all, set ran_ok=false and explain. An unmeasurable suite
 is a REPORTED FAILURE, never a zero.`,
@@ -430,7 +468,9 @@ Stop when the round target is met (stopped_reason=round_target_met), or when you
 cannot raise coverage this round (stopped_reason=no_gain, and say in notes what makes
 this module hard). Report ended_percent from a REAL coverage run in the worktree,
 never an estimate. Commit your work on ${m.branch} (a local commit only: never push,
-never open a PR, never merge).`
+never open a PR, never merge).
+
+${BOUNDED_RUNS}`
 
 const gatePrompt = (m, rounds) => {
   const files = [...new Set(rounds.flatMap((r) => r.test_files || []))]
@@ -455,6 +495,18 @@ them. Both checks are required:
    is vacuous: record survived_mutation=true. RESTORE the source every time
    (\`git -C ${m.worktree} checkout -- <file>\`) and confirm with git status.
 
+   Every mutant run is BOUNDED. Use the bounded runner's mutate mode: it applies
+   one mutation, runs the tests in their own process group with a timeout, and
+   restores the source in a finally block, then prints one JSON line:
+     python3 ${BOUNDED_RUNNER} --timeout ${MUTATION_RUN_TIMEOUT_S} --cwd ${m.worktree} \\
+       --mutate <file> --old '<exact text>' --new '<mutant text>' -- \\
+       <test command for that test, with pytest --timeout=${MUTANT_TEST_TIMEOUT_S}>
+   outcome "killed" or "killed_timeout" = caught. A mutant that TIMES OUT, hangs, or
+   is killed for memory counts as KILLED (caught), the standard mutation-testing
+   rule: the test did not pass. "survived" = the test is vacuous. Never hand-roll a
+   mutation loop with subprocess.run(timeout=...) around \`uv run\`: that is the exact
+   runner that orphaned a ~100 GB pytest grandchild.
+
 3. REMOVE every vacuous test from the worktree, re-run the module's tests to confirm
    they pass, and commit the removal on ${m.branch}. Set removed=true for each.
 
@@ -463,7 +515,9 @@ them. Both checks are required:
 
 If you could not actually run the mutation check, set mutation_check_ran=false and
 say why. Never report a gate you did not run as passed. Finding ZERO vacuous tests is
-possible but suspicious: say so in notes and describe what you did to break them.`
+possible but suspicious: say so in notes and describe what you did to break them.
+
+${BOUNDED_RUNS}`
 }
 
 const runModule = async (m) => {
@@ -491,7 +545,14 @@ const runModule = async (m) => {
   return { module: m, rounds, stop, tests_added: testsAdded, gate, gate_spawned: testsAdded > 0 }
 }
 
-const perModule = await pipeline(claimed, runModule)
+// At most maxParallel module chains run at once: batch the claimed list, keeping the
+// results index-aligned with claimed (a thrown chain is null, as before).
+const perModule = []
+for (let i = 0; i < claimed.length; i += maxParallel) {
+  const batch = claimed.slice(i, i + maxParallel)
+  if (claimed.length > maxParallel) log(`Module batch ${i / maxParallel + 1}: ${batch.length} module(s) (max_parallel=${maxParallel})`)
+  perModule.push(...(await pipeline(batch, runModule)))
+}
 
 // ── Phase 5: REPORT ────────────────────────────────────────────────────────
 // Every count and verdict below is computed HERE from what the agents returned, not
